@@ -11567,6 +11567,71 @@ do
     local player_wanted = player_editor:create_element({["name"] = "wanted"}, {["info"] = {}})
     player_wanted:set_info("Color", color3_fromrgb(122, 47, 52))
     player_wanted:set_visible(false)
+
+    -- > ( multi target )
+    multi_target = {
+        list = {},
+        color = color3_fromrgb(255, 60, 63),
+        raw_set = nil -- filled in by the ragebot section
+    }
+
+    menu_references["multi_target"] = player_editor:create_element({["name"] = "multi target"}, {["toggle"] = {["flag"] = "!multi_target"}})
+    menu_references["multi_target"]:set_visible(false)
+
+    multi_target.find = function(data)
+        local list = multi_target.list
+        for i = 1, #list do
+            if list[i] == data then
+                return i
+            end
+        end
+    end
+
+    multi_target.paint = function(data, active)
+        local player = data and data[2]
+        if player then
+            players:edit_item_color(player["Name"], active and multi_target.color or menu["colors"]["inactive_text"])
+        end
+    end
+
+    multi_target.prune = function()
+        local list = multi_target.list
+        for i = #list, 1, -1 do
+            local data = list[i]
+            if player_data[data[2]] ~= data then
+                remove(list, i)
+            end
+        end
+    end
+
+    multi_target.head = function()
+        multi_target.prune()
+        return multi_target.list[1]
+    end
+
+    multi_target.advance = function(dead_data)
+        local list = multi_target.list
+        if list[1] ~= dead_data then
+            return
+        end
+
+        remove(list, 1)
+        multi_target.paint(dead_data, false)
+        multi_target.prune()
+
+        local next_data = list[1]
+        local was_target = ragebot_target == dead_data
+        new_notification("multi target: "..dead_data[2]["Name"].." is done"..(next_data and ", next is "..next_data[2]["Name"] or ", list finished"), 1)
+
+        if was_target and flags["ragebot"] and multi_target.raw_set then
+            multi_target.raw_set(next_data, next_data and ("ragebot target set to "..next_data[2]["Name"].." (multi target)") or "multi target list finished")
+        end
+    end
+
+    create_connection(signals["on_player_died"], function(data)
+        multi_target.advance(data)
+    end)
+
     local player_status = player_editor:create_element({["name"] = "status"}, {["dropdown"] = {["flag"] = "0", ["options"] = {"friendly", "neutral", "enemy"}, ["default"] = {"neutral"}, ["requires_one"] = true}})
     local teleport_to = player_editor:create_element({["name"] = "teleport to"}, {["button"] = {}})
     local set_ragebot_target_button = player_editor:create_element({["name"] = "set ragebot target"}, {["button"] = {["fake"] = true}})
@@ -11584,14 +11649,61 @@ do
 
         if selected_player then
             player_wanted:set_visible(true)
-            local data = player_data[selected_player]
-            local status = data[1]
-            local information = data[17]
+            menu_references["multi_target"]:set_visible(true)
 
-            player_wanted:set_info("Text", information and information["Wanted"]["Value"] or "?")
-            player_status:set_dropdown({status == 1 and "neutral" or status == 2 and "friendly" or status == 3 and "enemy"}, false, true)
+            local data = player_data[selected_player]
+            if data then
+                local status = data[1]
+                local information = data[17]
+                player_wanted:set_info("Text", information and information["Wanted"]["Value"] or "?")
+                player_status:set_dropdown({status == 1 and "neutral" or status == 2 and "friendly" or "enemy"}, false, true)
+                menu_references["multi_target"]:set_toggle(multi_target.find(data) ~= nil)
+            else
+                menu_references["multi_target"]:set_toggle(false)
+            end
         else
             player_wanted:set_visible(false)
+            menu_references["multi_target"]:set_visible(false)
+        end
+    end)
+
+    create_connection(menu_references["multi_target"]["on_toggle_change"], function(value)
+        if not selected_player then
+            return
+        end
+
+        local data = player_data[selected_player]
+        if not data then
+            return
+        end
+
+        local list = multi_target.list
+        local index = multi_target.find(data)
+        local name = selected_player["Name"]
+
+        if value and not index then
+            if data[7] then
+                new_notification(name.." is dead, can't be a multi target", 3)
+                menu_references["multi_target"]:set_toggle(false)
+                return
+            end
+
+            list[#list+1] = data
+            multi_target.paint(data, true)
+            new_notification("added "..name.." to multi target ("..#list..")", 1)
+
+            if flags["ragebot"] and ragebot_target and ragebot_target ~= list[1] then
+                set_ragebot_target(list[1], "ragebot target set to "..list[1][2]["Name"].." (multi target)")
+            end
+        elseif not value and index then
+            remove(list, index)
+            multi_target.paint(data, false)
+            multi_target.prune()
+            new_notification("removed "..name.." from multi target", 1)
+
+            if flags["ragebot"] and ragebot_target == data and list[1] then
+                set_ragebot_target(list[1], "ragebot target set to "..list[1][2]["Name"].." (multi target)")
+            end
         end
     end)
 
@@ -22471,6 +22583,32 @@ do
         if fov_circle_outline then
             tween(fov_circle_outline, {["Color"] = ragebot_target and flags["ragebot_field_of_view_active_outline"] or flags["ragebot_field_of_view_outline_color"], ["Transparency"] = ragebot_target and 1-flags["ragebot_field_of_view_active_outline_transparency"] or 1-flags["ragebot_field_of_view_outline_transparency"]}, quad, out, 0.11)
         end
+    end)
+
+    -- > ( multi target hook )
+    -- Preserve the original setter for queue advancement and redirect ragebot picks to the queue head.
+    multi_target.raw_set = set_ragebot_target
+
+    set_ragebot_target = (function(target, message)
+        local head = multi_target.head()
+        while head and head[7] do
+            multi_target.advance(head)
+            head = multi_target.head()
+        end
+
+        if head then
+            if target ~= nil then
+                if target ~= head then
+                    target = head
+                    message = "ragebot target set to "..head[2]["Name"].." (multi target)"
+                end
+            elseif message and message:find("due to condition met", 1, true) then
+                -- Keep the current queue target so the ragebot can finish them.
+                return
+            end
+        end
+
+        return multi_target.raw_set(target, message)
     end)
 
     local is_defensive = false
